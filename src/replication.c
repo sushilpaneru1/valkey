@@ -1502,12 +1502,18 @@ void replconfCommand(client *c) {
             /* REPLCONF COMMIT <offset> is sent by the primary to inform
              * replicas of the current committed (durable) offset. This
              * is the highest offset that has been acknowledged by all
-             * required sync replicas on the primary side. */
-            serverAssert(server.primary != NULL);
-             long long offset;
+             * required sync replicas on the primary side.
+             *
+             * On the replica, this directly advances the committed offset
+             * and unblocks any clients whose responses were held pending
+             * durability confirmation. This is the replica-side counterpart
+             * of notifyDurabilityProgress() on the primary. */
+            long long offset;
             if ((getLongLongFromObject(c->argv[j + 1], &offset) != C_OK)) return;
             if (offset > server.durability.previous_acked_offset) {
                 server.durability.previous_acked_offset = offset;
+                drainCommittedKeys(offset);
+                unblockResponsesWithAckOffset(&server.durability, offset);
             }
             /* This command does not reply anything — it is injected
              * into the replication stream like PING and GETACK. */
@@ -4959,7 +4965,7 @@ int checkGoodReplicasStatus(void) {
  * When this node is a replica (has primary_host), always returns true. */
 int checkSyncReplicasStatus(void) {
     if (server.primary_host) return 1;  /* Not a primary — OK */
-    if (server.min_sync_replicas <= 0) return 1; /* Feature disabled — OK */
+    if (!server.sync_replication_enabled) return 1; /* Feature disabled — OK */
 
     listIter li;
     listNode *ln;
