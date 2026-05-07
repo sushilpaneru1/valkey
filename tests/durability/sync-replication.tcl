@@ -4,9 +4,14 @@
 # considered committed once acknowledged by a configured number of sync
 # replicas (ISR members).
 #
-# We use appendfsync=everysec so the AOF durability provider is DISABLED,
-# isolating the replication provider behavior. The replication provider
-# is enabled when min-sync-replicas > 0.
+# All tests run in cluster mode (single-shard). We use appendfsync=everysec
+# so the AOF durability provider is DISABLED, isolating the replication
+# provider behavior. The replication provider is enabled when
+# min-sync-replicas > 0.
+#
+# Each test is run twice: once without the durability side channel (plain
+# REPLCONF ACK path) and once with the side channel enabled (beacon-based
+# offset reporting via a dedicated thread).
 
 # Helper: wait until the primary reports at least N sync replicas in the ISR
 # by polling INFO durability for durability_sync_replicas.
@@ -23,29 +28,93 @@ proc get_write_blocked_count {primary} {
     getInfoProperty [$primary info durability] durability_write_blocked_count
 }
 
+# Helper: set up cluster replication between a primary and one or more replicas.
+# Uses CLUSTER MEET + CLUSTER ADDSLOTSRANGE + CLUSTER REPLICATE.
+# replicas is a flat list: {client host port client host port ...}
+proc setup_replication {primary primary_host primary_port replicas} {
+    set primary_id [$primary CLUSTER MYID]
+
+    # Meet all replicas with the primary.
+    foreach {replica rhost rport} $replicas {
+        $primary CLUSTER MEET $rhost $rport
+    }
+
+    # Wait for all nodes to see each other.
+    set expected_nodes [expr {1 + [llength $replicas] / 3}]
+    foreach {replica rhost rport} $replicas {
+        wait_for_condition 50 200 {
+            [llength [split [string trim [$replica CLUSTER NODES]] "\n"]] == $expected_nodes
+        } else {
+            fail "Replica at $rhost:$rport did not discover all cluster nodes"
+        }
+    }
+
+    # Allocate all slots to the primary.
+    $primary CLUSTER ADDSLOTSRANGE 0 16383
+
+    # Wait for cluster state to become ok.
+    wait_for_condition 50 200 {
+        [string match "*cluster_state:ok*" [$primary CLUSTER INFO]]
+    } else {
+        fail "Cluster state did not become ok on primary"
+    }
+
+    # Set up replication via CLUSTER REPLICATE.
+    foreach {replica rhost rport} $replicas {
+        $replica CLUSTER REPLICATE $primary_id
+    }
+}
+
+# Helper: tear down replication for replicas.
+# In cluster mode, REPLICAOF is not allowed. We use CLUSTER RESET to
+# remove the replication relationship.
+proc teardown_replication {replicas} {
+    foreach {replica rhost rport} $replicas {
+        catch {$replica CLUSTER RESET HARD}
+    }
+}
+
+# Run all tests with and without the durability side channel.
+foreach side_channel {0 1} {
+
+if {$side_channel} {
+    set sc_label "side-channel"
+    set sc_primary_overrides {appendonly yes appendfsync everysec sync-replication-enabled yes cluster-enabled yes cluster-databases 16 durability-side-channel yes}
+    set sc_sync_replica_overrides {sync-replication-enabled yes sync-eligible yes cluster-enabled yes cluster-databases 16 durability-side-channel yes durability-beacon-interval-ms 10}
+    set sc_nonsync_replica_overrides {sync-replication-enabled yes sync-eligible no cluster-enabled yes cluster-databases 16 durability-side-channel yes}
+} else {
+    set sc_label "main-thread"
+    set sc_primary_overrides {appendonly yes appendfsync everysec sync-replication-enabled yes cluster-enabled yes cluster-databases 16}
+    set sc_sync_replica_overrides {sync-replication-enabled yes sync-eligible yes cluster-enabled yes cluster-databases 16}
+    set sc_nonsync_replica_overrides {sync-replication-enabled yes sync-eligible no cluster-enabled yes cluster-databases 16}
+}
+
+set sc_tags "repl durability external:skip cluster singledb"
+
 # ==========================================================================
 # Test 1: If number of sync replicas < min-sync-replicas, primary rejects
 #         writes with CLUSTERDOWN.
 # ==========================================================================
 
-start_server {tags {"repl durability external:skip"} overrides {appendonly yes appendfsync everysec sync-replication-enabled yes min-sync-replicas 2}} {
+start_server [list tags [list $sc_tags] overrides [concat $sc_primary_overrides {min-sync-replicas 2}]] {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
 
-    start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+    start_server [list overrides $sc_sync_replica_overrides] {
         set replica1 [srv 0 client]
         set replica1_host [srv 0 host]
         set replica1_port [srv 0 port]
 
-        start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+        start_server [list overrides $sc_sync_replica_overrides] {
             set replica2 [srv 0 client]
             set replica2_host [srv 0 host]
             set replica2_port [srv 0 port]
 
-            test "Sync replication: write rejected when ISR count < min-sync-replicas" {
+            test "Sync replication ($sc_label): write rejected when ISR count < min-sync-replicas" {
                 # Connect only replica1 — ISR will have 1 member
-                $replica1 replicaof $primary_host $primary_port
+                setup_replication $primary $primary_host $primary_port \
+                    [list $replica1 $replica1_host $replica1_port]
                 wait_replica_online $primary
                 wait_for_isr_count $primary 1
 
@@ -54,7 +123,14 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
                 assert_match "*CLUSTERDOWN*" $err
 
                 # Connect replica2 so ISR reaches 2
-                $replica2 replicaof $primary_host $primary_port
+                set primary_id [$primary CLUSTER MYID]
+                $primary CLUSTER MEET $replica2_host $replica2_port
+                wait_for_condition 50 200 {
+                    [llength [split [string trim [$replica2 CLUSTER NODES]] "\n"]] == 3
+                } else {
+                    fail "Replica2 did not discover all cluster nodes"
+                }
+                $replica2 CLUSTER REPLICATE $primary_id
                 wait_replica_online $primary
                 wait_for_isr_count $primary 2
 
@@ -62,8 +138,8 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
                 assert_equal "OK" [$primary set mykey myvalue]
 
                 # Cleanup
-                $replica1 replicaof no one
-                $replica2 replicaof no one
+                teardown_replication [list $replica1 $replica1_host $replica1_port \
+                    $replica2 $replica2_host $replica2_port]
             }
         }
     }
@@ -74,25 +150,26 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
 #         only when both sync replicas ack back.
 # ==========================================================================
 
-start_server {tags {"repl durability external:skip"} overrides {appendonly yes appendfsync everysec sync-replication-enabled yes min-sync-replicas 2}} {
+start_server [list tags [list $sc_tags] overrides [concat $sc_primary_overrides {min-sync-replicas 2}]] {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
 
-    start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+    start_server [list overrides $sc_sync_replica_overrides] {
         set replica1 [srv 0 client]
         set replica1_host [srv 0 host]
         set replica1_port [srv 0 port]
 
-        start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+        start_server [list overrides $sc_sync_replica_overrides] {
             set replica2 [srv 0 client]
             set replica2_host [srv 0 host]
             set replica2_port [srv 0 port]
 
-            test "Sync replication: write released only after both sync replicas ack" {
+            test "Sync replication ($sc_label): write released only after both sync replicas ack" {
                 # Connect both replicas and let them sync
-                $replica1 replicaof $primary_host $primary_port
-                $replica2 replicaof $primary_host $primary_port
+                setup_replication $primary $primary_host $primary_port \
+                    [list $replica1 $replica1_host $replica1_port \
+                          $replica2 $replica2_host $replica2_port]
                 wait_replica_online $primary
                 wait_for_isr_count $primary 2
 
@@ -121,8 +198,8 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
                 $rd close
 
                 # Cleanup
-                $replica1 replicaof no one
-                $replica2 replicaof no one
+                teardown_replication [list $replica1 $replica1_host $replica1_port \
+                    $replica2 $replica2_host $replica2_port]
             }
         }
     }
@@ -133,25 +210,26 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
 #         replica lags behind (paused with SIGSTOP).
 # ==========================================================================
 
-start_server {tags {"repl durability external:skip"} overrides {appendonly yes appendfsync everysec sync-replication-enabled yes min-sync-replicas 2}} {
+start_server [list tags [list $sc_tags] overrides [concat $sc_primary_overrides {min-sync-replicas 2}]] {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
 
-    start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+    start_server [list overrides $sc_sync_replica_overrides] {
         set replica1 [srv 0 client]
         set replica1_host [srv 0 host]
         set replica1_port [srv 0 port]
 
-        start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+        start_server [list overrides $sc_sync_replica_overrides] {
             set replica2 [srv 0 client]
             set replica2_host [srv 0 host]
             set replica2_port [srv 0 port]
 
-            test "Sync replication: write blocked when one replica lags behind" {
+            test "Sync replication ($sc_label): write blocked when one replica lags behind" {
                 # Connect both replicas and let them sync
-                $replica1 replicaof $primary_host $primary_port
-                $replica2 replicaof $primary_host $primary_port
+                setup_replication $primary $primary_host $primary_port \
+                    [list $replica1 $replica1_host $replica1_port \
+                          $replica2 $replica2_host $replica2_port]
                 wait_replica_online $primary
                 wait_for_isr_count $primary 2
 
@@ -197,8 +275,8 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
                 $rd close
 
                 # Cleanup
-                $replica1 replicaof no one
-                $replica2 replicaof no one
+                teardown_replication [list $replica1 $replica1_host $replica1_port \
+                    $replica2 $replica2_host $replica2_port]
             }
         }
     }
@@ -206,30 +284,25 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
 
 # ==========================================================================
 # Test 4: Replica killed — writes rejected, replica restarts — writes resume.
-#
-# Primary with min-sync-replicas=1 and a single sync replica. The replica
-# is killed (shutdown nosave). After repl-timeout the primary disconnects
-# the dead replica, ISR drops to 0, and writes are rejected with
-# CLUSTERDOWN. The replica is then restarted, rejoins the ISR, and writes
-# are accepted again.
 # ==========================================================================
 
-start_server {tags {"repl durability external:skip"} overrides {appendonly yes appendfsync everysec sync-replication-enabled yes min-sync-replicas 1}} {
+start_server [list tags [list $sc_tags] overrides [concat $sc_primary_overrides {min-sync-replicas 1}]] {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
 
-    start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+    start_server [list overrides $sc_sync_replica_overrides] {
         set replica [srv 0 client]
         set replica_host [srv 0 host]
         set replica_port [srv 0 port]
 
-        test "Sync replication: replica killed — writes rejected then resume after restart" {
+        test "Sync replication ($sc_label): replica killed — writes rejected then resume after restart" {
             # Use a short repl-timeout so the primary detects the dead
             # replica quickly.
             $primary config set repl-timeout 3
 
-            $replica replicaof $primary_host $primary_port
+            setup_replication $primary $primary_host $primary_port \
+                [list $replica $replica_host $replica_port]
             wait_replica_online $primary
             wait_for_isr_count $primary 1
 
@@ -250,11 +323,11 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
             catch {$primary set key2 value2} err
             assert_match "*CLUSTERDOWN*" $err
 
-            # Restart the replica — it reconnects and rejoins the ISR
+            # Restart the replica — in cluster mode it remembers its
+            # cluster state and reconnects automatically.
             restart_server 0 true false
 
             set replica [srv 0 client]
-            $replica replicaof $primary_host $primary_port
             wait_replica_online $primary
             wait_for_isr_count $primary 1
 
@@ -263,7 +336,7 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
 
             # Cleanup
             $primary config set repl-timeout 60
-            $replica replicaof no one
+            teardown_replication [list $replica $replica_host $replica_port]
         }
     }
 }
@@ -271,32 +344,27 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
 # ==========================================================================
 # Test 5: Replica paused (SIGSTOP) — writes rejected after ISR timeout,
 #         replica resumed — writes accepted again.
-#
-# Primary with min-sync-replicas=1 and a single sync replica. The replica
-# is paused with SIGSTOP. It stops sending ACKs, and after the ISR timeout
-# (REPLICA_ISR_TIMEOUT = 10 s) the primary removes it from the ISR.
-# With 0 ISR members, writes are rejected. Resuming the replica (SIGCONT)
-# lets it catch up, rejoin the ISR, and writes succeed again.
 # ==========================================================================
 
-start_server {tags {"repl durability external:skip"} overrides {appendonly yes appendfsync everysec sync-replication-enabled yes min-sync-replicas 1}} {
+start_server [list tags [list $sc_tags] overrides [concat $sc_primary_overrides {min-sync-replicas 1}]] {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
 
-    start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+    start_server [list overrides $sc_sync_replica_overrides] {
         set replica [srv 0 client]
         set replica_host [srv 0 host]
         set replica_port [srv 0 port]
         set replica_pid [srv 0 pid]
 
-        test "Sync replication: replica paused — writes rejected then resume after SIGCONT" {
+        test "Sync replication ($sc_label): replica paused — writes rejected then resume after SIGCONT" {
             # Use a repl-timeout longer than the ISR timeout so the
             # replica is removed from the ISR but NOT disconnected.
             # ISR timeout is 10 s, so set repl-timeout to 20 s.
             $primary config set repl-timeout 20
 
-            $replica replicaof $primary_host $primary_port
+            setup_replication $primary $primary_host $primary_port \
+                [list $replica $replica_host $replica_port]
             wait_replica_online $primary
             wait_for_isr_count $primary 1
 
@@ -332,7 +400,8 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
             $rd close
 
             # Cleanup
-            $replica replicaof no one
+            $primary config set repl-timeout 60
+            teardown_replication [list $replica $replica_host $replica_port]
         }
     }
 }
@@ -340,45 +409,32 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
 # ==========================================================================
 # Test 6: Consensus offset advances based on sync replica only, not
 #         regular (non-sync) replicas.
-#
-# Primary with min-sync-replicas=1, one sync replica, and one regular
-# replica (sync-eligible=no). Writes succeed. The regular replica is
-# paused (SIGSTOP). Writes continue to succeed and the committed offset
-# advances, proving that consensus depends solely on the sync replica.
 # ==========================================================================
 
-start_server {tags {"repl durability external:skip"} overrides {appendonly yes appendfsync everysec sync-replication-enabled yes min-sync-replicas 1}} {
+start_server [list tags [list $sc_tags] overrides [concat $sc_primary_overrides {min-sync-replicas 1}]] {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
 
     # Sync replica
-    start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+    start_server [list overrides $sc_sync_replica_overrides] {
         set sync_replica [srv 0 client]
         set sync_replica_host [srv 0 host]
         set sync_replica_port [srv 0 port]
 
         # Regular (non-sync) replica
-        start_server {overrides {sync-replication-enabled yes sync-eligible no}} {
+        start_server [list overrides $sc_nonsync_replica_overrides] {
             set regular_replica [srv 0 client]
             set regular_replica_host [srv 0 host]
             set regular_replica_port [srv 0 port]
             set regular_replica_pid [srv 0 pid]
 
-            test "Sync replication: committed offset advances based on sync replica, not regular replica" {
+            test "Sync replication ($sc_label): committed offset advances based on sync replica, not regular replica" {
                 # Connect both replicas
-                $sync_replica replicaof $primary_host $primary_port
-                $regular_replica replicaof $primary_host $primary_port
-
-                # Wait for both replicas to come online
-                wait_for_condition 50 100 {
-                    [string match "*slave0:*state=online*" [$primary info replication]] &&
-                    [string match "*slave1:*state=online*" [$primary info replication]]
-                } else {
-                    fail "Replicas did not come online"
-                }
-
-                # Wait for sync replica to join ISR
+                setup_replication $primary $primary_host $primary_port \
+                    [list $sync_replica $sync_replica_host $sync_replica_port \
+                          $regular_replica $regular_replica_host $regular_replica_port]
+                wait_replica_online $primary
                 wait_for_isr_count $primary 1
 
                 # Verify writes succeed with both replicas healthy
@@ -415,8 +471,8 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
                 assert {$offset_final > $offset_after}
 
                 # Cleanup
-                $sync_replica replicaof no one
-                $regular_replica replicaof no one
+                teardown_replication [list $sync_replica $sync_replica_host $sync_replica_port \
+                    $regular_replica $regular_replica_host $regular_replica_port]
             }
         }
     }
@@ -425,36 +481,34 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
 # ==========================================================================
 # Test 7: [WBL] Replica blocks reads on uncommitted keys until REPLCONF COMMIT
 #         arrives from the primary.
-#
-# The primary's replication provider is paused so the committed offset
-# stops advancing. A write on the primary replicates to the replica but
-# the committed offset doesn't move. A client connected to the replica
-# reads the key — the read is blocked because the key is dirty
-# (uncommitted). When the provider is resumed, the primary sends
-# REPLCONF COMMIT with the new offset, the replica unblocks the read.
 # ==========================================================================
 
-start_server {tags {"repl durability external:skip"} overrides {appendonly yes appendfsync everysec sync-replication-enabled yes min-sync-replicas 2}} {
+start_server [list tags [list $sc_tags] overrides [concat $sc_primary_overrides {min-sync-replicas 2}]] {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
 
-    start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+    start_server [list overrides $sc_sync_replica_overrides] {
         set replica1 [srv 0 client]
         set replica1_host [srv 0 host]
         set replica1_port [srv 0 port]
 
-        start_server {overrides {sync-replication-enabled yes sync-eligible yes}} {
+        start_server [list overrides $sc_sync_replica_overrides] {
             set replica2 [srv 0 client]
             set replica2_host [srv 0 host]
             set replica2_port [srv 0 port]
 
-            test "Sync replication: replica blocks read on uncommitted key until REPLCONF COMMIT" {
+            test "Sync replication ($sc_label): replica blocks read on uncommitted key until REPLCONF COMMIT" {
                 # Connect both replicas and wait for ISR
-                $replica1 replicaof $primary_host $primary_port
-                $replica2 replicaof $primary_host $primary_port
+                setup_replication $primary $primary_host $primary_port \
+                    [list $replica1 $replica1_host $replica1_port \
+                          $replica2 $replica2_host $replica2_port]
                 wait_replica_online $primary
                 wait_for_isr_count $primary 2
+
+                # Enable READONLY on replicas so reads are served locally
+                # instead of being redirected with MOVED.
+                $replica1 READONLY
 
                 # Verify the system is healthy — a write succeeds end-to-end
                 assert_equal "OK" [$primary set committed-key committed-value]
@@ -472,9 +526,6 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
                 $primary DEBUG durability-provider-pause replication
 
                 # Write a key on the primary via a deferring client.
-                # We don't read the reply — it will be blocked by the
-                # paused provider, but we don't care about it.
-                # The write replicates to replicas via the replication stream.
                 set writer [valkey_deferring_client -2]
                 $writer set uncommitted-key uncommitted-value
 
@@ -485,13 +536,13 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
                     fail "Key was not tracked as uncommitted on replica"
                 }
 
-                # Now a client connected to replica1 reads the key.
-                # The key exists on the replica (it was replicated) but
-                # is uncommitted (committed offset hasn't advanced).
-                # The read should be blocked.
+                # A client connected to replica1 reads the key.
+                # The key exists but is uncommitted — the read should be blocked.
                 set replica_blocked_before [getInfoProperty [$replica1 info durability] durability_clients_waiting_ack]
 
                 set reader [valkey_deferring_client -1]
+                $reader READONLY
+                $reader read ;# consume the READONLY OK reply
                 $reader get uncommitted-key
 
                 # Verify the read is blocked on the replica
@@ -514,9 +565,11 @@ start_server {tags {"repl durability external:skip"} overrides {appendonly yes a
                 $writer close
 
                 # Cleanup
-                $replica1 replicaof no one
-                $replica2 replicaof no one
+                teardown_replication [list $replica1 $replica1_host $replica1_port \
+                    $replica2 $replica2_host $replica2_port]
             }
         }
     }
 }
+
+} ;# end foreach side_channel

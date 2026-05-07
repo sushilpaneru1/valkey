@@ -57,6 +57,11 @@
 
 #include "trace/trace_commands.h"
 
+/* Forward declarations for functions defined in other modules. */
+void durabilityBeaconSend(void);
+void durabilityThreadInit(void);
+int durabilityThreadGetNotifyFd(void);
+
 #include <time.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -1802,6 +1807,25 @@ extern int ProcessingEventsWhileBlocked;
  * Note: This function is (currently) called from two functions:
  * 1. aeMain - The main server loop
  * 2. processEventsWhileBlocked - Process clients during RDB/AOF load
+/**
+ * Event handler for the durability thread's notify pipe.
+ * Called by the event loop when the durability thread signals that the
+ * committed offset has advanced. Drains the pipe and calls
+ * notifyDurabilityProgress() to unblock waiting clients immediately.
+ */
+void durabilityNotifyPipeReadHandler(struct aeEventLoop *el, int fd, void *privdata, int mask) {
+    UNUSED(el);
+    UNUSED(privdata);
+    UNUSED(mask);
+    /* Drain the pipe — we don't care about the data, just the signal. */
+    char buf[64];
+    while (read(fd, buf, sizeof(buf)) > 0) {}
+    notifyDurabilityProgress();
+}
+
+/* This function gets called every time the server is entering the
+ * main loop of the event driven library, that is, before to sleep
+ * for ready file descriptors.
  *
  * If it was called from processEventsWhileBlocked we don't want
  * to perform all actions (For example, we don't want to expire
@@ -1943,6 +1967,30 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         if (listLength(server.clients_waiting_acks) && prev_fsynced_reploff != server.fsynced_reploff) dont_sleep = 1;
     }
     notifyDurabilityProgress();
+
+    /* Send durability beacon on every beforeSleep iteration.
+     * The beacon is just an 8-byte write — negligible cost. The internal
+     * check (offset <= last_beacon_off) prevents redundant sends when
+     * the offset hasn't advanced. This eliminates the timer-based delay
+     * and sends the beacon as soon as reploff advances. */
+    if (server.durability_side_channel && server.cluster_enabled &&
+        server.primary_host && server.primary &&
+        server.durability_side_conn_fd != -1) {
+        durabilityBeaconSend();
+    }
+
+    /* Send REPLCONF ACK to primary at the configured repl-ack-period (ms).
+     * For sub-second periods, this runs from serverCron (which fires at server.hz)
+     * rather than replicationCron (which fires at 1Hz). */
+    if (server.primary_host && server.primary && !(server.primary->flag.pre_psync) &&
+        server.repl_ack_period < 1000) {
+        static mstime_t last_repl_ack_time = 0;
+        mstime_t now = mstime();
+        if (now - last_repl_ack_time >= server.repl_ack_period) {
+            replicationSendAck();
+            last_repl_ack_time = now;
+        }
+    }
 
     /* Handle writes with pending output buffers. */
     int client_writes = handleClientsWithPendingWrites();
@@ -2375,6 +2423,9 @@ void initServerConfig(void) {
     server.repl_down_since = 0; /* Never connected, repl is down since EVER. */
     server.primary_repl_offset = 0;
     server.fsynced_reploff_pending = 0;
+    server.durability_side_conn_fd = -1;
+    server.durability_beacon_backoff_ms = 0;
+    server.durability_last_beacon_off = 0;
     server.rdb_client_id = -1;
     server.loading_process_events_interval_ms = LOADING_PROCESS_EVENTS_INTERVAL_DEFAULT;
     server.loading_rio = NULL;
@@ -7702,6 +7753,19 @@ __attribute__((weak)) int main(int argc, char **argv) {
             if (listener->ct == NULL) continue;
 
             serverLog(LL_NOTICE, "Ready to accept connections %s", getConnectionTypeName(listener->ct->get_type()));
+        }
+
+        /* Start the durability side channel thread if enabled and this node
+         * is a primary (no primary_host configured). */
+        if (server.durability_side_channel && !server.primary_host) {
+            durabilityThreadInit();
+            /* Register the notify pipe with the event loop so the durability
+             * thread can wake us when the committed offset advances. */
+            int notify_fd = durabilityThreadGetNotifyFd();
+            if (notify_fd != -1) {
+                aeCreateFileEvent(server.el, notify_fd, AE_READABLE,
+                                  durabilityNotifyPipeReadHandler, NULL);
+            }
         }
 
         if (server.supervised_mode == SUPERVISED_SYSTEMD) {

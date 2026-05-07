@@ -527,6 +527,7 @@ ENGINE_SERVER_OBJ = \
 	reply_blocking.o \
 	durable_task.o \
 	durability_provider.o \
+	durability_thread.o \
 	uncommitted_keys.o \
     resp_parser.o \
     rio.o \

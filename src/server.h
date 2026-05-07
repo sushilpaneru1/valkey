@@ -2164,6 +2164,7 @@ struct valkeyServer {
     long long fsynced_reploff;                  /* Largest replication offset that has been confirmed to be fsynced */
     int replicas_eldb;                          /* Last SELECTed DB in replication output */
     int repl_ping_replica_period;               /* Primary pings the replica every N seconds */
+    int repl_ack_period;                        /* Replica sends ACK to primary every N milliseconds */
     replBacklog *repl_backlog;                  /* Replication backlog for partial syncs */
     long long repl_backlog_size;                /* Backlog circular buffer size */
     replDataBuf pending_repl_data;              /* Replication data buffer for dual-channel-replication */
@@ -2179,6 +2180,12 @@ struct valkeyServer {
                                                    Replicas send REPLCONF capa sync-replica during handshake. */
     int sync_eligible;                          /* If true, this replica is eligible to join the ISR.
                                                    Must be combined with sync_replication_enabled. */
+    int durability_side_channel;                /* If true, enable durability side channel (immutable). */
+    int durability_side_channel_port;           /* Port for side channel connections (immutable, 0 = port+30000). */
+    int durability_beacon_interval_ms;          /* Beacon send interval in milliseconds (default 10ms). */
+    int durability_side_conn_fd;                /* Replica: side connection fd to primary's durability port. */
+    int durability_beacon_backoff_ms;           /* Replica: current reconnect backoff in ms. */
+    long long durability_last_beacon_off;       /* Replica: last offset sent via beacon. */
     int repl_diskless_sync;                     /* Primary send RDB to replicas sockets directly. */
     int repl_diskless_load;                     /* Replica parse RDB directly from the socket.
                                                  * see REPL_DISKLESS_LOAD_* enum */
@@ -3238,6 +3245,7 @@ void freeReplicaReferencedReplBuffer(client *replica);
 void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv, int argc);
 void updateReplicasWaitingBgsave(int bgsaveerr, int type);
 void replicationCron(void);
+void replicationSendAck(void);
 void replicationStartPendingFork(void);
 void replicationHandlePrimaryDisconnection(void);
 void replicationCachePrimary(client *c);

@@ -41,6 +41,7 @@
 #include "connection.h"
 #include "module.h"
 #include "cluster_migrateslots.h"
+#include "durability_thread.h"
 
 #include <memory.h>
 #include <sys/time.h>
@@ -57,6 +58,8 @@ void replicationDiscardCachedPrimary(void);
 void replicationResurrectCachedPrimary(connection *conn);
 void replicationResurrectProvisionalPrimary(void);
 void replicationSendAck(void);
+void durabilityBeaconConnect(void);
+void durabilityBeaconClose(void);
 int replicaPutOnline(client *replica);
 void replicaStartCommandStream(client *replica);
 int cancelReplicationHandshake(int reconnect);
@@ -1334,6 +1337,11 @@ void freeClientReplicationData(client *c) {
         if (c->repl_data->repl_state == REPLICA_STATE_ONLINE)
             moduleFireServerEvent(VALKEYMODULE_EVENT_REPLICA_CHANGE, VALKEYMODULE_SUBEVENT_REPLICA_CHANGE_OFFLINE,
                                   NULL);
+        /* If this was an ISR member, update the durability thread's snapshot. */
+        if (c->repl_data->is_in_sync) {
+            c->repl_data->is_in_sync = 0;
+            durabilityThreadPublishISRSnapshot();
+        }
     }
     if (c->flag.primary) replicationHandlePrimaryDisconnection();
     sdsfree(c->repl_data->replica_addr);
@@ -1474,6 +1482,7 @@ void replconfCommand(client *c) {
                           replicationGetReplicaName(c),
                           c->repl_data->repl_ack_off,
                           server.durability.previous_acked_offset);
+                durabilityThreadPublishISRSnapshot();
             }
 
             /* If this was a diskless replication, we need to really put
@@ -2389,6 +2398,10 @@ void replicaAfterLoadPrimaryRDB(connection *conn, rdbSaveInfo *rsi, int disk_bas
         server.repl_down_since = 0;
         /* Send the initial ACK immediately to put this replica in online state. */
         replicationSendAck();
+        /* Establish durability side channel connection if enabled. */
+        if (server.durability_side_channel && server.cluster_enabled) {
+            durabilityBeaconConnect();
+        }
     }
 
     /* Fire the primary link modules event. */
@@ -3432,6 +3445,10 @@ void dualChannelSyncSuccess(void) {
     /* We can resume reading from the primary connection once the local replication buffer has been loaded. */
     replicationSteadyStateInit();
     replicationSendAck(); /* Send ACK to notify primary that replica is synced */
+    /* Establish durability side channel connection if enabled. */
+    if (server.durability_side_channel && server.cluster_enabled) {
+        durabilityBeaconConnect();
+    }
     server.rdb_client_id = -1;
     server.repl_rdb_channel_state = REPL_DUAL_CHANNEL_STATE_NONE;
 }
@@ -4592,6 +4609,9 @@ void replicationHandlePrimaryDisconnection(void) {
     if (server.repl_state == REPL_STATE_CONNECTED)
         moduleFireServerEvent(VALKEYMODULE_EVENT_PRIMARY_LINK_CHANGE, VALKEYMODULE_SUBEVENT_PRIMARY_LINK_DOWN, NULL);
 
+    /* Close durability side channel connection if open. */
+    durabilityBeaconClose();
+
     server.primary = NULL;
     server.repl_state = REPL_STATE_CONNECT;
     server.repl_down_since = server.unixtime;
@@ -4719,6 +4739,173 @@ void roleCommand(client *c) {
         }
         addReplyBulkCString(c, replica_state);
         addReplyLongLong(c, server.primary ? server.primary->repl_data->reploff : -1);
+    }
+}
+
+/* ================================= Durability Side Channel (Replica) ======= */
+
+/* Maximum backoff for side channel reconnection attempts. */
+#define DT_BEACON_BACKOFF_MAX_MS 30000
+#define DT_BEACON_BACKOFF_INIT_MS 1000
+
+/**
+ * Close the durability side channel connection on the replica side.
+ */
+void durabilityBeaconClose(void) {
+    if (server.durability_side_conn_fd != -1) {
+        close(server.durability_side_conn_fd);
+        server.durability_side_conn_fd = -1;
+        serverLog(LL_NOTICE, "Durability side channel: connection to primary closed");
+    }
+}
+
+/**
+ * Establish a side channel connection to the primary's durability port.
+ *
+ * Sends a handshake containing:
+ *   [CLUSTER_NAMELEN bytes] this replica's cluster node ID
+ *   [variable] NUL-terminated auth token (or just NUL if no auth)
+ *
+ * Reads a 1-byte response: 0x00 = OK, 0x01 = Rejected.
+ * On success, sets the fd to non-blocking and stores it in
+ * server.durability_side_conn_fd.
+ */
+void durabilityBeaconConnect(void) {
+    if (!server.durability_side_channel || !server.cluster_enabled) return;
+    if (server.durability_side_conn_fd != -1) return; /* Already connected. */
+    if (!server.primary_host) return;
+
+    /* Connect to the primary's durability port (primary_port + 30000).
+     * Note: we do NOT use server.durability_side_channel_port here because
+     * that's our local listening port, not the primary's. */
+    int port = server.primary_port + 30000;
+
+    /* TCP connect (blocking for simplicity — happens once per connection). */
+    char neterr[ANET_ERR_LEN];
+    int fd = anetTcpNonBlockConnect(neterr, server.primary_host, port);
+    if (fd == ANET_ERR) {
+        serverLog(LL_WARNING, "Durability side channel: connect to %s:%d failed: %s",
+                  server.primary_host, port, neterr);
+        return;
+    }
+
+    /* Set a short send/recv timeout for the handshake. */
+    anetBlock(NULL, fd);
+    anetSendTimeout(NULL, fd, 5000);
+    anetRecvTimeout(NULL, fd, 5000);
+
+    /* Wait for connection to complete. */
+    if (anetGetError(fd) != 0) {
+        serverLog(LL_WARNING, "Durability side channel: connect to %s:%d failed after poll",
+                  server.primary_host, port);
+        close(fd);
+        return;
+    }
+
+    /* Send handshake: cluster node ID + NUL-terminated auth. */
+    char *my_node_id = server.cluster->myself->name;
+    if (write(fd, my_node_id, CLUSTER_NAMELEN) != CLUSTER_NAMELEN) {
+        serverLog(LL_WARNING, "Durability side channel: handshake write node_id failed");
+        close(fd);
+        return;
+    }
+
+    /* Send auth token (NUL-terminated). If no auth, just send NUL. */
+    if (server.primary_auth) {
+        size_t auth_len = sdslen(server.primary_auth);
+        if (write(fd, server.primary_auth, auth_len + 1) != (ssize_t)(auth_len + 1)) {
+            serverLog(LL_WARNING, "Durability side channel: handshake write auth failed");
+            close(fd);
+            return;
+        }
+    } else {
+        char nul = '\0';
+        if (write(fd, &nul, 1) != 1) {
+            serverLog(LL_WARNING, "Durability side channel: handshake write NUL auth failed");
+            close(fd);
+            return;
+        }
+    }
+
+    /* Read 1-byte response. */
+    uint8_t resp;
+    if (read(fd, &resp, 1) != 1) {
+        serverLog(LL_WARNING, "Durability side channel: handshake read response failed");
+        close(fd);
+        return;
+    }
+
+    if (resp != 0x00) {
+        serverLog(LL_WARNING, "Durability side channel: handshake rejected by primary (code=%d)", resp);
+        close(fd);
+        return;
+    }
+
+    /* Success — set to non-blocking for beacon writes. */
+    anetNonBlock(NULL, fd);
+    anetEnableTcpNoDelay(NULL, fd);
+    anetSendTimeout(NULL, fd, 0);
+    anetRecvTimeout(NULL, fd, 0);
+
+    server.durability_side_conn_fd = fd;
+    server.durability_beacon_backoff_ms = DT_BEACON_BACKOFF_INIT_MS;
+    serverLog(LL_NOTICE, "Durability side channel: connected to primary %s:%d",
+              server.primary_host, port);
+}
+
+/**
+ * Send a durability beacon (8-byte little-endian offset) to the primary.
+ * Called from the replica's main thread alongside replicationSendAck().
+ */
+void durabilityBeaconSend(void) {
+    if (server.durability_side_conn_fd == -1) return;
+    if (!server.primary) return;
+
+    long long offset = server.primary->repl_data->reploff;
+    if (offset <= server.durability_last_beacon_off) return; /* No progress. */
+
+    uint64_t le_offset = (uint64_t)offset;
+    memrev64ifbe(&le_offset);
+
+    ssize_t nwritten = write(server.durability_side_conn_fd, &le_offset, 8);
+    if (nwritten != 8) {
+        if (nwritten == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* Socket buffer full — skip this beacon, try next time. */
+            return;
+        }
+        /* Write error — connection lost. */
+        serverLog(LL_WARNING, "Durability side channel: beacon write failed: %s", strerror(errno));
+        durabilityBeaconClose();
+        return;
+    }
+
+    server.durability_last_beacon_off = offset;
+}
+
+/**
+ * Handle reconnection with exponential backoff.
+ * Called from replicationCron() when the side connection is down.
+ */
+static void durabilityBeaconReconnect(void) {
+    static mstime_t last_attempt = 0;
+
+    if (server.durability_side_conn_fd != -1) return; /* Already connected. */
+    if (!server.durability_side_channel || !server.cluster_enabled) return;
+    if (!server.primary_host || !server.primary) return;
+
+    mstime_t now = mstime();
+    if (now - last_attempt < server.durability_beacon_backoff_ms) return;
+    last_attempt = now;
+
+    durabilityBeaconConnect();
+
+    if (server.durability_side_conn_fd == -1) {
+        /* Connection failed — increase backoff. */
+        server.durability_beacon_backoff_ms = min(server.durability_beacon_backoff_ms * 2,
+                                                  DT_BEACON_BACKOFF_MAX_MS);
+    } else {
+        /* Success — reset backoff. */
+        server.durability_beacon_backoff_ms = DT_BEACON_BACKOFF_INIT_MS;
     }
 }
 
@@ -5344,10 +5531,27 @@ void replicationCron(void) {
         connectWithPrimary();
     }
 
-    /* Send ACK to primary from time to time.
+    /* Send ACK to primary from time to time, controlled by repl-ack-period (ms).
      * Note that we do not send periodic acks to primary that don't
-     * support PSYNC and replication offsets. */
-    if (server.primary_host && server.primary && !(server.primary->flag.pre_psync)) replicationSendAck();
+     * support PSYNC and replication offsets.
+     * This handles periods >= 1000ms. For sub-second periods, the ACK is
+     * sent from serverCron directly at higher frequency. */
+    if (server.primary_host && server.primary && !(server.primary->flag.pre_psync) &&
+        server.repl_ack_period >= 1000) {
+        static mstime_t last_ack_time = 0;
+        mstime_t now = mstime();
+        if (now - last_ack_time >= server.repl_ack_period) {
+            replicationSendAck();
+            last_ack_time = now;
+        }
+    }
+
+    /* Handle durability side channel reconnection (backoff-based, stays in cron). */
+    if (server.durability_side_channel && server.cluster_enabled &&
+        server.primary_host && server.primary &&
+        server.durability_side_conn_fd == -1) {
+        durabilityBeaconReconnect();
+    }
 
     /* If we have attached replicas, PING them from time to time.
      * So replicas can implement an explicit timeout to primaries, and will
@@ -5420,6 +5624,7 @@ void replicationCron(void) {
         listNode *ln;
 
         listRewind(server.replicas, &li);
+        int isr_changed = 0;
         while ((ln = listNext(&li))) {
             client *replica = ln->value;
 
@@ -5428,12 +5633,14 @@ void replicationCron(void) {
             time_t last_ack_age = server.unixtime - replica->repl_data->repl_ack_time;
             if (last_ack_age > REPLICA_ISR_TIMEOUT) {
                 replica->repl_data->is_in_sync = 0;
+                isr_changed = 1;
                 serverLog(LL_WARNING,
                           "Removing replica %s from ISR: no ACK for %ld seconds (timeout=%d)",
                           replicationGetReplicaName(replica),
                           (long)last_ack_age, REPLICA_ISR_TIMEOUT);
             }
         }
+        if (isr_changed) durabilityThreadPublishISRSnapshot();
     }
 
     /* Disconnect timedout replicas. */

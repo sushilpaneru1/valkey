@@ -1,4 +1,5 @@
 #include "server.h"
+#include "durability_thread.h"
 #include <assert.h>
 #include <stdatomic.h>
 
@@ -92,7 +93,8 @@ static bool replicationProviderIsEnabled(void) {
 }
 
 /**
- * Compute the consensus offset across all sync replicas.
+ * Compute the consensus offset across all sync replicas using the
+ * main-thread REPLCONF ACK path only.
  *
  * For every REPLCONF ACK, we calculate the minimum ack offset of all
  * online sync replicas (those in the ISR — with is_in_sync flag set).
@@ -107,7 +109,7 @@ static bool replicationProviderIsEnabled(void) {
  * If there are fewer ISR members than min-sync-replicas,
  * returns -1 to block consensus advancement (the shard is not writable).
  */
-static long long replicationProviderGetAckedOffset(void) {
+static long long replicationProviderGetMainThreadOffset(void) {
     listIter li;
     listNode *ln;
     int sync_replica_count = 0;
@@ -135,6 +137,32 @@ static long long replicationProviderGetAckedOffset(void) {
     /* If min_offset was never updated (shouldn't happen given count check),
      * return 0 as a safe fallback. */
     return (min_offset == LLONG_MAX) ? 0 : min_offset;
+}
+
+/**
+ * Get the replication provider's acknowledged offset.
+ *
+ * When the durability side channel is enabled, returns the maximum of
+ * the main-thread computed offset and the side-channel committed offset.
+ * This ensures whichever channel advances first wins.
+ *
+ * When the side channel is disabled, returns the main-thread offset only
+ * (existing behavior).
+ */
+static long long replicationProviderGetAckedOffset(void) {
+    long long main_offset = replicationProviderGetMainThreadOffset();
+
+    /* Side channel offset — O(1) atomic read. */
+    if (server.durability_side_channel) {
+        long long side_offset = durabilityThreadGetCommittedOffset();
+        /* If main thread says -1 (not enough ISR members), but side channel
+         * has a valid offset, the side channel can't override the quorum
+         * requirement — the main thread ISR check is authoritative. */
+        if (main_offset == -1) return -1;
+        if (side_offset > main_offset) return side_offset;
+    }
+
+    return main_offset;
 }
 
 static durabilityProvider builtinReplicationProvider = {
