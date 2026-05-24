@@ -13,6 +13,9 @@
 #if HAVE_ARM_NEON
 #include <arm_neon.h>
 #endif
+#if HAVE_X86_SIMD
+#include <immintrin.h>
+#endif
 /*
  *-----------------------------------------------------------------------------
  * Volatile Set - Adaptive, Expiry-aware Set Structure
@@ -500,6 +503,54 @@ static inline uint32_t pvFindSIMD_NEON64(void *const *data, uint32_t len, const 
     return i;
 }
 #endif
+
+#if HAVE_X86_SIMD
+/* Finds the index of the given element using AVX2 SIMD instructions.
+ *
+ * Processes 4 pointers (4 x 64-bit) per iteration using 256-bit registers.
+ *
+ * Returns:
+ *   The index if found; otherwise, the index where scalar search should continue. */
+ATTRIBUTE_TARGET_AVX2
+static inline uint32_t pvFindSIMD_AVX2(void *const *data, uint32_t len, const void *elem) {
+    __m256i target = _mm256_set1_epi64x((long long)(uintptr_t)elem);
+    uint32_t i = 0;
+
+    for (; i + 4 <= len; i += 4) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i *)(data + i));
+        __m256i cmp = _mm256_cmpeq_epi64(chunk, target);
+        int mask = _mm256_movemask_epi8(cmp);
+        if (mask) {
+            /* Each 64-bit lane produces 8 bits in the mask.
+             * Divide bit position by 8 to get the lane index. */
+            return i + (__builtin_ctz(mask) >> 3);
+        }
+    }
+    return i;
+}
+
+/* Finds the index of the given element using AVX-512 SIMD instructions.
+ *
+ * Processes 8 pointers (8 x 64-bit) per iteration using 512-bit registers.
+ *
+ * Returns:
+ *   The index if found; otherwise, the index where scalar search should continue. */
+ATTRIBUTE_TARGET_AVX512
+static inline uint32_t pvFindSIMD_AVX512(void *const *data, uint32_t len, const void *elem) {
+    __m512i target = _mm512_set1_epi64((long long)(uintptr_t)elem);
+    uint32_t i = 0;
+
+    for (; i + 8 <= len; i += 8) {
+        __m512i chunk = _mm512_loadu_si512((const __m512i *)(data + i));
+        __mmask8 mask = _mm512_cmpeq_epi64_mask(chunk, target);
+        if (mask) {
+            return i + __builtin_ctz(mask);
+        }
+    }
+    return i;
+}
+#endif
+
 /* Finds the index of the given element in the pVector.
  *
  * Parameters:
@@ -513,7 +564,7 @@ static inline uint32_t pvFindSIMD_NEON64(void *const *data, uint32_t len, const 
  *   - This compares elements using raw pointer equality (`==`).
  *   - If pv is NULL or empty, returns 0 as a safe fallback.
  *   - Return value being equal to pv->len can be used to check for absence.
- *   - Uses NEON SIMD acceleration on ARM64 when available. */
+ *   - Uses SIMD acceleration when available (AVX-512, AVX2, or NEON). */
 uint32_t pvFind(const pVector *pv, const void *elem) {
     if (!pv || pv->len == 0) return 0;
 
@@ -521,7 +572,17 @@ uint32_t pvFind(const pVector *pv, const void *elem) {
     void *const *data = pv->data;
     uint32_t i = 0;
 
-#if HAVE_ARM_NEON
+#if HAVE_X86_SIMD
+    if (len >= 8) {
+        if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+            __builtin_cpu_supports("avx512vl")) {
+            i = pvFindSIMD_AVX512(data, len, elem);
+        } else if (__builtin_cpu_supports("avx2")) {
+            i = pvFindSIMD_AVX2(data, len, elem);
+        }
+        if (i < len && data[i] == elem) return i;
+    }
+#elif HAVE_ARM_NEON
     if (len >= 8) {
         i = pvFindSIMD_NEON64(data, len, elem);
         if (i < len && data[i] == elem) return i;
